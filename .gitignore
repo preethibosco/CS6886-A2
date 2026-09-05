@@ -1,0 +1,12 @@
+# datasets and build artefacts
+data/
+checkpoints/
+wandb/
+venv/
+__pycache__/
+*.pyc
+*.pt
+*.pth
+.ipynb_checkpoints/
+logs/
+results/figures/*.pdf
