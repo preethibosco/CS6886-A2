@@ -26,8 +26,16 @@ ap.add_argument("--grid", default="",
 ap.add_argument("--weight-bits", type=int, default=4)
 ap.add_argument("--activation-bits", type=int, default=8)
 ap.add_argument("--method", default="linear_per_tensor")
+ap.add_argument("--depthwise-bits", type=int, default=8,
+                help="depthwise convolutions; 15.4% of the compressed model at w3/sp0.8")
+ap.add_argument("--bn-bits", type=int, default=8,
+                help="BatchNorm params and buffers; 18.2% of the compressed model at w3/sp0.8")
+ap.add_argument("--edge-bits", type=int, default=8, help="stem convolution and classifier")
 ap.add_argument("--epochs", type=int, default=20)
 ap.add_argument("--lr", type=float, default=0.01)
+ap.add_argument("--grad-clip", type=float, default=5.0,
+                help="global gradient-norm clip; 0 disables. Required at low bit "
+                     "width - see scripts/diagnose_qat_collapse.py")
 ap.add_argument("--max-layer-sparsity", type=float, default=0.95,
                 help="cap on any single layer's sparsity under the global threshold")
 ap.add_argument("--out", default="results/qat_results.json")
@@ -57,10 +65,11 @@ out = []
 for wb, ab, sp in points:
     print(f"=== w{wb} a{ab} sparsity {sp:.2f} ===", flush=True)
     cfg = CompressionConfig(weight_bits=wb, activation_bits=ab,
-                            depthwise_bits=8, edge_bits=8, bn_bits=8, sparsity=sp,
+                            depthwise_bits=args.depthwise_bits,
+                            edge_bits=args.edge_bits, bn_bits=args.bn_bits, sparsity=sp,
                             max_layer_sparsity=args.max_layer_sparsity,
                             weight_method=args.method, use_huffman=True)
-    qcfg = QATConfig(epochs=args.epochs, lr=args.lr)
+    qcfg = QATConfig(epochs=args.epochs, lr=args.lr, grad_clip=args.grad_clip)
 
     # PTQ reference: the same configuration without any fine-tuning.
     ptq_model, ptq_res = compress(model, cfg, calib_loader, device)
@@ -79,6 +88,8 @@ for wb, ab, sp in points:
 
     rec = {"sparsity": sp, "weight_bits": wb,
            "activation_bits": ab, "method": args.method,
+           "depthwise_bits": args.depthwise_bits, "bn_bits": args.bn_bits,
+           "edge_bits": args.edge_bits,
            "ptq_top1": ptq_acc["top1"], "qat_top1": acc["top1"],
            "baseline_top1": base["top1"],
            "model_ratio": s["model_compression_ratio"],

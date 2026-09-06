@@ -65,6 +65,17 @@ class QATConfig:
                                      # the mask has already accounted for.
     label_smoothing: float = 0.1
     min_lr: float = 0.0
+    # Global gradient-norm clip. This is not optional at low bit width.
+    # The straight-through estimator evaluates the gradient at the quantized
+    # point but applies it to a full-precision master, and at 3 bits the
+    # mismatch produces very large gradients: an instrumented run reached
+    # |grad| = 8.3e5 by iteration 25, drove one layer's weights to 6.7e14, and
+    # the loss pinned at ln(10) + smoothing (uniform output) for the rest of
+    # training. The failure is absorbing - a dead layer has no gradient, so no
+    # later step can revive it - and whether it triggers depends on batch order,
+    # so identical configurations succeed or fail run to run. Clipping removes
+    # the run-to-run lottery. See scripts/diagnose_qat_collapse.py.
+    grad_clip: float = 5.0
     # Re-run k-means every `recluster_every` epochs so the codebook tracks the
     # weights as they move. 0 disables re-clustering (codebook fixed after the
     # first fit).
@@ -225,6 +236,9 @@ def finetune(model: nn.Module, cfg: CompressionConfig, qcfg: QATConfig,
             logits = work(images)
             loss = criterion(logits, targets)
             loss.backward()
+
+            if qcfg.grad_clip and qcfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(work.parameters(), qcfg.grad_clip)
 
             if masters is not None:
                 _restore(policy, masters)
