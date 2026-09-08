@@ -4,7 +4,7 @@ Every number is read from results/*.json or recomputed from the model, so the
 report cannot drift from the experiments.
 
 Run:  python scripts/gen_report.py [--repo-url URL]
-Then: pandoc SUBMISSION.md -o SUBMISSION.pdf --pdf-engine=pdflatex -V geometry:margin=2.2cm
+Then: pandoc SUBMISSION.md -o SUBMISSION.pdf --pdf-engine=pdflatex -V geometry:margin=2.2cm -V fontsize=10pt
 """
 from __future__ import annotations
 
