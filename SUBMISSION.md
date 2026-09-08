@@ -1,5 +1,5 @@
 ---
-title: "CS6886 Assignment 2 — MobileNet-v2 on CIFAR-10"
+title: "CS6886 Assignment 2: MobileNet-v2 on CIFAR-10"
 subtitle: "Compression by pruning, quantization and Huffman coding"
 author: ""
 ---
@@ -32,11 +32,11 @@ Normalisation uses the CIFAR-10 training-set channel statistics, mean
 
 Train transforms, in order:
 
-1. `RandomCrop(32, padding=4)` — pad 4 px each side, crop back to 32x32.
+1. `RandomCrop(32, padding=4)`. Pad 4 px each side, then crop back to 32x32.
 2. `RandomHorizontalFlip(p=0.5)`.
-3. `ToTensor()` — HWC uint8 to CHW float in [0,1].
+3. `ToTensor()`. HWC uint8 to CHW float in [0,1].
 4. `Normalize(mean, std)`.
-5. `RandomErasing(p=0.25, scale=(0.02, 0.20))` — applied after normalisation, so
+5. `RandomErasing(p=0.25, scale=(0.02, 0.20))`. Applied after normalisation, so
    the erased patch is filled at the channel mean.
 
 Test transforms: `ToTensor()` and `Normalize` only.
@@ -49,9 +49,9 @@ threshold is ever fitted on test data.
 
 MobileNet-v2 is implemented from scratch rather than imported. The ImageNet
 configuration downsamples 32x, which on a 32x32 input reaches a 1x1 feature map
-by the c=64 stage. Two downsampling steps are removed — the stem stride and the
-c=24 stage stride, both 2 to 1 — giving 8x total downsampling and a 4x4 final
-feature map. Everything else follows the paper.
+by the c=64 stage. We remove two downsampling steps, the stem stride and the
+c=24 stage stride, both from 2 to 1. That gives 8x total downsampling and a 4x4
+final feature map. Everything else follows the paper.
 
 | Setting | Value |
 |---|---|
@@ -75,7 +75,7 @@ convolution is a strong pull toward zero here and can remove channels entirely.
 ### (c) Results
 
 Final test top-1 is **95.17%** at epoch 293, against
-99.46% on the training set — a gap of
+99.46% on the training set, a gap of
 4.29 points. Curves are in Figure 1.
 
 In Figure 1 the test loss sits below the train loss for the whole run. This is
@@ -112,9 +112,9 @@ instead of forcing every layer to the same ratio.
 Surviving weights need their positions recorded. Two encodings are implemented
 and the cheaper one is chosen per layer:
 
-* *bitmap* — one presence bit per weight plus codes for the survivors. Costs
+* *bitmap*: one presence bit per weight plus codes for the survivors. Costs
   `N + nnz*b` bits.
-* *relative index* — a delta to the previous survivor, with filler entries when
+* *relative index*: a delta to the previous survivor, with filler entries when
   a gap exceeds the largest representable delta. Costs `entries*(b + index_bits)`.
 
 The delta width is searched per layer over 3, 4, 5, 6 and 8 bits rather than
@@ -145,7 +145,7 @@ range that occurs; tensors after a linear-bottleneck projection are signed and
 near zero-mean and use symmetric quantization.
 
 **Fine-tuning** (`src/compress/qat.py`). One-shot compression at these settings
-is not usable — at 70% sparsity and 3-bit
+is not usable. At 70% sparsity and 3-bit
 weights the model drops to 10.00%. Pruning masks are fixed and the model is retrained with
 quantization in the forward pass, using the straight-through estimator in its
 master-weight form: quantize in place, forward and backward at the quantized
@@ -197,7 +197,7 @@ to MB at the end.
 | Sparse position metadata | bitmap bits, or delta bits including filler entries |
 | Quantization parameters | 2^b fp32 centroids (k-means), or fp32 scales (linear) |
 | Huffman code tables | 5 bits per alphabet symbol, canonical form |
-| BatchNorm | none — folded away |
+| BatchNorm | none, folded away |
 | Biases | fp16 |
 
 Two items are easy to miss and both are counted. `model.parameters()` does not
@@ -217,8 +217,8 @@ reproduces the weights the accuracy number was measured with.
 ### (a) Compression levels
 
 Two sweeps were run. A post-training sweep over 60
-configurations — weight bits in {2,3,4,6,8}, activation bits in {2,4,6,8},
-sparsity in {0, 0.5, 0.8} — and a fine-tuned sweep over 23
+configurations (weight bits in {2,3,4,6,8}, activation bits in {2,4,6,8},
+sparsity in {0, 0.5, 0.8}), and a fine-tuned sweep over 23
 configurations covering the useful region.
 
 ### (b) Accuracy
@@ -240,12 +240,12 @@ Fine-tuned results, Pareto front first (Figure 4 plots all of them):
 | 3 | 8 | 0.80 | no | 31.40x | 0.276 | 27.12% | **94.24%** |
 | 4 | 8 | 0.80 | no | 23.31x | 0.372 | 45.18% | **94.73%** |
 
-Two results worth stating. First, 3-bit weights at moderate sparsity beat 4-bit
+Two results follow. First, 3-bit weights at moderate sparsity beat 4-bit
 weights at heavy sparsity: w3/sp0.80 and w4/sp0.95 reach the same ratio, 31.4x
 against 31.3x, but differ by 1.77 points of top-1. 3-bit per-tensor quantization
-is already an implicit pruner — 88.3% of weights round to zero at sparsity 0 — so
-explicit pruning removes redundancy that has largely gone while still paying
-index metadata. Second, and for the same reason, raising sparsity from 70% to 90%
+is already an implicit pruner: 88.3% of weights round to zero at sparsity 0.
+Explicit pruning therefore removes redundancy that has largely gone, while still
+paying for index metadata. Second, and for the same reason, raising sparsity from 70% to 90%
 at 3 bits moves the ratio only 31.59x to 32.23x and costs 0.6 points.
 
 ## Q4. Compression analysis
@@ -261,8 +261,8 @@ quantization parameters and Huffman tables.
 pushing one image through the network and recording the output tensor of every
 quantization site (52 sites: 35 after ReLU6, 17 after the residual add). The
 ratio is the sum over those tensors of 32 bits per element, divided by the sum of
-8 bits per element — the reduction in activation traffic
-over one inference. Peak single-tensor activation, which is what bounds an
+8 bits per element, which is the reduction in activation
+traffic over one inference. Peak single-tensor activation, which is what bounds an
 on-chip buffer, is 147,456 elements: 0.562 MB fp32 against
 0.141 MB quantized, the same ratio.
 
@@ -277,7 +277,7 @@ a model compression ratio of **35.90x**.
 
 **(a)** Training, evaluation and compression are separate import paths. Nothing
 in `src/compress/` imports `src/train.py`, and `src/models/mobilenetv2.py`
-contains no compression code — the activation quantizers attach through forward
+contains no compression code. The activation quantizers attach through forward
 hooks.
 
 **(b)** `README.md` gives the exact commands, the environment and pinned

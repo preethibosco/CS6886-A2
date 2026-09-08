@@ -1,4 +1,4 @@
-# CS6886 Assignment 2 — MobileNet-v2 on CIFAR-10, trained and compressed
+# CS6886 Assignment 2: MobileNet-v2 on CIFAR-10, trained and compressed
 
 Training MobileNet-v2 from scratch on CIFAR-10, then compressing it with a
 four-stage pipeline written from scratch: **magnitude pruning → weight
@@ -6,8 +6,8 @@ sharing / linear quantization → canonical Huffman coding**, plus calibrated
 **activation quantization**.
 
 No compression API or library function is used anywhere. `torch.ao.quantization`,
-`torch.nn.utils.prune`, `sklearn`, and the `zlib`/`gzip` family are all absent —
-enforced automatically by an AST scan in `scripts/conformance.py`, not by
+`torch.nn.utils.prune`, `sklearn`, and the `zlib`/`gzip` family are all absent.
+This is enforced automatically by an AST scan in `scripts/conformance.py`, not by
 convention.
 
 ---
@@ -32,7 +32,7 @@ Exact versions used for every number in the report (`requirements.txt`):
 | Python | 3.10 |
 
 Hardware: single NVIDIA RTX 5090 (`sm_120`, CUDA 13.1). The cu128 wheel is
-required — earlier PyTorch builds ship no kernels for `sm_120`.
+required, because earlier PyTorch builds ship no kernels for `sm_120`.
 
 ## 2. Seeds and reproducibility
 
@@ -115,7 +115,7 @@ STATUS.md                  current state against Q1-Q5
 
 Training, evaluation and compression are separate import paths. Nothing in
 `compress/` imports `train.py`, and `models/mobilenetv2.py` contains no
-compression code — the activation quantizers attach through forward hooks.
+compression code. The activation quantizers attach through forward hooks.
 
 ## 5. Method summary
 
@@ -143,7 +143,8 @@ Huffman code-length tables, BatchNorm parameters **and** the
 **How activations are measured (Q4b).** One image is pushed through the network
 and the output tensor of every quantization site is recorded. The reported ratio
 is the sum over all such tensors of 32 bits/element divided by the sum of
-`b` bits/element — the reduction in activation **traffic** over one inference.
+`b` bits/element, which is the reduction in activation **traffic** over one
+inference.
 The **peak** single-tensor figure is reported alongside, since that is what
 bounds the on-chip buffer.
 
@@ -155,3 +156,16 @@ figure claims, **decodes it, and compares against the weights the accuracy
 number was produced from**. It exists because two bugs previously reached
 execution while printing entirely plausible compression ratios. See
 `LEARNINGS.md`.
+
+## 7. House style
+
+`scripts/check_style.py` enforces the writing rules on the submitted document
+and the repository markdown. The rules are not invented: they are measured
+against a submitted paper of 25,191 words, and only patterns that paper uses
+zero times are treated as hard failures. Patterns it uses once or twice are
+reported as advisory. Running the checker against that paper is how the split
+was set, and a rule the reference itself breaks is a rule that does not belong.
+
+```bash
+./venv/bin/python scripts/check_style.py SUBMISSION.md README.md LEARNINGS.md STATUS.md
+```
