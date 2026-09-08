@@ -31,6 +31,8 @@ ap.add_argument("--depthwise-bits", type=int, default=8,
 ap.add_argument("--bn-bits", type=int, default=8,
                 help="BatchNorm params and buffers; 18.2% of the compressed model at w3/sp0.8")
 ap.add_argument("--edge-bits", type=int, default=8, help="stem convolution and classifier")
+ap.add_argument("--fold-bn", action="store_true",
+                help="fold BatchNorm into the preceding conv (exact at inference)")
 ap.add_argument("--epochs", type=int, default=20)
 ap.add_argument("--lr", type=float, default=0.01)
 ap.add_argument("--grad-clip", type=float, default=5.0,
@@ -68,7 +70,8 @@ for wb, ab, sp in points:
                             depthwise_bits=args.depthwise_bits,
                             edge_bits=args.edge_bits, bn_bits=args.bn_bits, sparsity=sp,
                             max_layer_sparsity=args.max_layer_sparsity,
-                            weight_method=args.method, use_huffman=True)
+                            weight_method=args.method, use_huffman=True,
+                            fold_bn=args.fold_bn)
     qcfg = QATConfig(epochs=args.epochs, lr=args.lr, grad_clip=args.grad_clip)
 
     # PTQ reference: the same configuration without any fine-tuning.
@@ -82,14 +85,16 @@ for wb, ab, sp in points:
                                f"    epoch {r['epoch']:2d}/{args.epochs}  "
                                f"train {r['train_top1']:.2f}  test {r['test_top1']:.2f}",
                                flush=True))
-    cmodel, res = compress(tuned, cfg, calib_loader, device)
+    # `tuned` may already be folded; the ratio must still be quoted against the
+    # original fp32 network, so pass it explicitly as the baseline.
+    cmodel, res = compress(tuned, cfg, calib_loader, device, baseline_model=model)
     acc = evaluate(cmodel, test_loader, device)
     s = res.summary
 
     rec = {"sparsity": sp, "weight_bits": wb,
            "activation_bits": ab, "method": args.method,
            "depthwise_bits": args.depthwise_bits, "bn_bits": args.bn_bits,
-           "edge_bits": args.edge_bits,
+           "edge_bits": args.edge_bits, "fold_bn": args.fold_bn,
            "ptq_top1": ptq_acc["top1"], "qat_top1": acc["top1"],
            "baseline_top1": base["top1"],
            "model_ratio": s["model_compression_ratio"],

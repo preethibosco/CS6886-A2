@@ -46,6 +46,7 @@ from ..evaluate import evaluate
 from ..utils import AverageMeter
 from .pipeline import (CompressionConfig, attach_activation_quantizers,
                        calibrate_activations)
+from .fold import fold_model
 from .prune import PruneConfig, Pruner
 from .quantize import fake_quantize
 from .weight_share import share_weights
@@ -180,6 +181,11 @@ def finetune(model: nn.Module, cfg: CompressionConfig, qcfg: QATConfig,
          re-applying the mask after every optimiser step.
     """
     work = copy.deepcopy(model).to(device)
+    # Fold before fine-tuning, not after: the folded convolution is the layer
+    # that will be deployed, so it is the layer whose quantization error the
+    # network must learn to absorb.
+    if cfg.fold_bn:
+        work, _ = fold_model(work)
     policy = _layer_policy(work, cfg)
 
     # ---- stage 1: pruning

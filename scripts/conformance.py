@@ -275,6 +275,59 @@ def section_g(checkpoint: str | None):
 
 
 # --------------------------------------------------------------------- H
+def section_g2():
+    """fold_bn must remove BatchNorm, not merely stop charging for it.
+
+    sizing.batchnorm_cost returns an empty cost list when `folded` is set, so if
+    the folding transform were missing the pipeline would report BatchNorm as
+    zero storage while the model still ran it in fp32 - an ~18% under-report of
+    the compressed model. This check ties the accounting to the transform.
+    """
+    print("\nG2. BatchNorm folding is real, not just uncharged")
+    import copy as _copy
+    from src.compress.fold import fold_model, verify_fold
+    from src.compress.sizing import batchnorm_cost
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    m = mobilenet_v2_cifar().to(device).eval()
+    folded, n = fold_model(_copy.deepcopy(m))
+    r = verify_fold(m, folded, device)
+    check("G2", "folds every conv+BN pair", n == 52, f"{n} pairs")
+    check("G2", "no BatchNorm survives the fold", r["remaining_bn"] == 0,
+          f"{r['remaining_bn']} remaining")
+    check("G2", "folded network computes the same function",
+          r["agree"] and r["same_argmax"], f"max|diff| = {r['max_abs_diff']:.2e}")
+    charged = len(batchnorm_cost(folded, num_bits=8, folded=True))
+    check("G2", "zero BN cost is only claimed when no BN remains",
+          charged == 0 and r["remaining_bn"] == 0)
+
+
+def section_g3():
+    """The fp32 baseline must not shrink when a pipeline stage transforms the model.
+
+    compress() previously derived the baseline from whatever model it was handed.
+    Fine-tuning folds BatchNorm before compress() sees the model, so the folded
+    runs were quoted against a baseline 51,168 values smaller than the network
+    that was actually trained.
+    """
+    print("\nG3. Compression ratio is quoted against the untransformed model")
+    import copy as _copy
+    from src.compress.fold import fold_model
+    from src.compress.sizing import fp32_model_bits
+    m = mobilenet_v2_cifar()
+    folded, _ = fold_model(_copy.deepcopy(m))
+    a = fp32_model_bits(m)["total_values"]
+    b = fp32_model_bits(folded)["total_values"]
+    check("G3", "folding does shrink the measured model", b < a, f"{a:,} -> {b:,}")
+    import inspect
+    from src.compress.pipeline import compress
+    sig = inspect.signature(compress)
+    check("G3", "compress() accepts an explicit baseline_model",
+          "baseline_model" in sig.parameters)
+    src_qat = open("scripts/run_qat.py").read()
+    check("G3", "run_qat.py passes the pre-fine-tuning model as baseline",
+          "baseline_model=model" in src_qat)
+
+
 def section_h():
     print("\nH. Storage accounting completeness")
     m = mobilenet_v2_cifar()
@@ -301,7 +354,7 @@ def main():
     print(" CONFORMANCE: architecture -> implementation -> assignment")
     print("=" * 74)
     section_a(); section_b(); section_c(); section_d()
-    section_e(); section_f(); section_g(args.checkpoint); section_h()
+    section_e(); section_f(); section_g(args.checkpoint); section_g2(); section_g3(); section_h()
 
     passed = sum(1 for *_, p, _ in RESULTS if p)
     print("\n" + "=" * 74)

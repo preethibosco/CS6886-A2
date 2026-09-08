@@ -52,6 +52,7 @@ import torch
 import torch.nn as nn
 
 from ..models.mobilenetv2 import ConvBNReLU, InvertedResidual
+from .fold import fold_model
 from .huffman import huffman_result_from_counts
 from .prune import (PruneConfig, Pruner, magnitude_mask, relative_index_stats)
 from .quantize import (ActivationQuantizer, ActQuantConfig, compute_qparams,
@@ -108,6 +109,11 @@ class CompressionConfig:
     quantize_activations: bool = True
 
     # ---- batchnorm
+    # Fold BatchNorm into the preceding convolution. Exact at inference, and it
+    # replaces 4 stored vectors per layer (gamma, beta, running_mean,
+    # running_var) with 1 fused bias. Costs nothing in accuracy by construction,
+    # but widens the spread of per-channel weight ranges, which per-tensor
+    # quantization is sensitive to - so it is measured, not assumed.
     fold_bn: bool = False
 
     def describe(self) -> str:
@@ -498,7 +504,8 @@ class CompressionResult:
 
 
 def compress(model: nn.Module, cfg: CompressionConfig, calib_loader,
-             device: torch.device, calib_batches: int = 8
+             device: torch.device, calib_batches: int = 8,
+             baseline_model: Optional[nn.Module] = None
              ) -> Tuple[nn.Module, CompressionResult]:
     """Run the full pipeline on a copy of `model`.
 
@@ -512,9 +519,25 @@ def compress(model: nn.Module, cfg: CompressionConfig, calib_loader,
          weights never influence the codebook,
       4. activation quantizers are attached and calibrated on the *compressed*
          weights, since that is the network that will actually run.
+
+    `baseline_model` supplies the reference the compression ratio is quoted
+    against. It must be given whenever `model` has already been transformed -
+    in particular when fine-tuning has already folded BatchNorm away. Measuring
+    the baseline from an already-folded model quotes the ratio against a network
+    that is itself 51,168 values smaller than the one that was trained, which
+    understates the ratio by 2.3% and makes the weight ratio collapse onto the
+    model ratio.
     """
     work = copy.deepcopy(model).to(device)
-    baseline = fp32_model_bits(work, include_bn_buffers=True)
+    # The baseline is the untransformed fp32 network: the compression ratio must
+    # be quoted against the model as trained, never against one already shrunk
+    # by a stage of the pipeline.
+    baseline = fp32_model_bits(baseline_model if baseline_model is not None else work,
+                               include_bn_buffers=True)
+
+    # stage 0: fold BatchNorm into the preceding convolution (exact at inference)
+    if cfg.fold_bn:
+        work, _n_folded = fold_model(work)
 
     # stage 1: pruning
     pruner = None

@@ -46,7 +46,7 @@ def run_one(model, cfg: CompressionConfig, loaders, device, base_top1: float,
         # the one evaluated.
         tuned, hist = finetune(model, cfg, qcfg, train_loader, test_loader,
                                calib_loader, device)
-        cmodel, res = compress(tuned, cfg, calib_loader, device)
+        cmodel, res = compress(tuned, cfg, calib_loader, device, baseline_model=model)
     else:
         cmodel, res = compress(model, cfg, calib_loader, device)
         hist = []

@@ -33,6 +33,7 @@ def main():
     ap.add_argument("--no-act-quant", action="store_true")
     ap.add_argument("--method-mse-tolerance", type=float, default=1.25)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--fold-bn", action="store_true")
     ap.add_argument("--full-table", action="store_true")
     args = ap.parse_args()
 
@@ -54,7 +55,7 @@ def main():
         bn_bits=args.bn_bits, sparsity=args.sparsity,
         weight_method=args.weight_method, use_huffman=not args.no_huffman,
         quantize_activations=not args.no_act_quant,
-        method_mse_tolerance=args.method_mse_tolerance,
+        method_mse_tolerance=args.method_mse_tolerance, fold_bn=args.fold_bn,
     )
     print(f"config: {cfg.describe()}\n")
 
