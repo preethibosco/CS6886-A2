@@ -61,6 +61,10 @@ class LayerCost:
     @property
     def bits_per_weight(self) -> float:
         """Effective bits per *original* weight, the honest per-layer headline."""
+        # Divides by numel (every weight the layer started with), not by nnz
+        # (the survivors). Dividing by nnz would report a flattering number that
+        # improves as more weights are deleted, which is the wrong direction:
+        # the question is what the layer costs, not what its survivors cost.
         return self.total_bits / self.numel if self.numel else 0.0
 
 
@@ -169,9 +173,17 @@ def fp32_model_bits(model: nn.Module, include_bn_buffers: bool = True) -> Dict[s
     understating the *baseline* would inflate every compression ratio computed
     against it.
     """
+    # model.parameters() returns only tensors the optimiser trains. BatchNorm's
+    # running_mean and running_var are BUFFERS: tracked during training, never
+    # gradient-updated, and absolutely required at inference. Counting only
+    # parameters would understate the baseline by 34,112 values here, and
+    # understating the baseline inflates every compression ratio measured
+    # against it.
     params = sum(p.numel() for p in model.parameters())
     buffers = sum(b.numel() for n, b in model.named_buffers()
                   if "running_mean" in n or "running_var" in n)
+    # num_batches_tracked is deliberately excluded: it is a counter used during
+    # training and inference never reads it.
     total = params + (buffers if include_bn_buffers else 0)
     return {
         "param_values": params,
@@ -205,8 +217,14 @@ def batchnorm_cost(model: nn.Module, num_bits: int = 8, folded: bool = False) ->
     for name, m in model.named_modules():
         if isinstance(m, nn.BatchNorm2d):
             c = m.num_features
-            values = 4 * c                    # gamma, beta, running_mean, running_var
-            # 4 vectors x (fp32 scale + fp32 zero-point) of per-tensor metadata.
+            # Four vectors of length C must be stored per BatchNorm layer:
+            # gamma and beta (learned) plus running_mean and running_var
+            # (buffers). For the whole network that is 4 * 17,056 = 68,224
+            # values, 0.26 MB in fp32.
+            values = 4 * c
+            # Each vector is quantized per tensor, so each needs its own fp32
+            # scale and zero-point. Tiny in absolute terms, but charged, because
+            # a decoder cannot reconstruct the vector without them.
             meta = 4 * 2 * 32
             costs.append(LayerCost(name=name, kind="bn", numel=values, nnz=values,
                                    num_bits=num_bits, value_bits=values * num_bits,
@@ -254,6 +272,11 @@ class ActivationCost:
 
     @property
     def total_ratio(self) -> float:
+        # Every site uses the same bit width, so this reduces to 32/b: 4x at
+        # 8 bits, 8x at 4 bits. It is reported as a sum over tensors rather than
+        # as 32/b because the two would diverge the moment different sites were
+        # given different bit widths, and the sum is the definition that
+        # survives that change.
         return self.total_fp32_bits / self.total_quant_bits if self.total_quant_bits else float("inf")
 
     @property

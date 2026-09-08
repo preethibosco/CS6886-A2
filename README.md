@@ -89,7 +89,14 @@ Supporting experiments (each answers one design question with a measurement):
 ./venv/bin/python scripts/sweep_method_tolerance.py   # per-layer method selection
 ```
 
-## 4. Repository layout
+## 4. Reading the code
+
+`WALKTHROUGH.md` is a reading order for the repository: which file to open
+first, what each one does, and the single idea that makes the rest of it follow.
+Every source file carries inline comments with tensor shapes and worked numeric
+examples, so the walkthrough is a map rather than a replacement for reading them.
+
+## 5. Repository layout
 
 ```
 src/
@@ -110,6 +117,7 @@ src/
 scripts/                   verification and experiment drivers
 results/                   metrics, figures, sweep output
 LEARNINGS.md               transferable rules, each traced to a real bug
+WALKTHROUGH.md             reading order for the codebase
 STATUS.md                  current state against Q1-Q5
 ```
 
@@ -117,7 +125,7 @@ Training, evaluation and compression are separate import paths. Nothing in
 `compress/` imports `train.py`, and `models/mobilenetv2.py` contains no
 compression code. The activation quantizers attach through forward hooks.
 
-## 5. Method summary
+## 6. Method summary
 
 **Which layers are compressed, and the exceptions (Q2b).**
 
@@ -148,7 +156,7 @@ inference.
 The **peak** single-tensor figure is reported alongside, since that is what
 bounds the on-chip buffer.
 
-## 6. Verification
+## 7. Verification
 
 `scripts/conformance.py` runs 21 checks spanning architecture → implementation →
 accounting. The decisive one (section G) takes the encoding the reported size
@@ -157,7 +165,7 @@ number was produced from**. It exists because two bugs previously reached
 execution while printing entirely plausible compression ratios. See
 `LEARNINGS.md`.
 
-## 7. House style
+## 8. House style
 
 `scripts/check_style.py` enforces the writing rules on the submitted document
 and the repository markdown. The rules are not invented: they are measured

@@ -64,6 +64,12 @@ def build_param_groups(model: nn.Module, weight_decay: float,
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
+        # p.ndim <= 1 catches every 1-D tensor, which here means BatchNorm gamma
+        # and beta plus any bias. Conv and linear weights are 4-D and 2-D, so
+        # they fall through to the decayed group.
+        # For this model the split is 36 decayed tensors (35 pointwise/standard
+        # convs + the classifier weight) and 122 undecayed (104 BatchNorm
+        # gamma/beta + 17 depthwise weights + the classifier bias).
         if p.ndim <= 1 or name.endswith(".bias") or id(p) in depthwise_param_ids:
             no_decay.append(p)
         else:
@@ -84,10 +90,18 @@ def lr_at(epoch_float: float, base_lr: float, total_epochs: int,
     into a regime the network takes many epochs to recover from.
     """
     if epoch_float < warmup_epochs:
-        # Start from a small non-zero LR rather than exactly 0.
+        # Linear ramp from ~0 to base_lr over the first `warmup_epochs`.
+        # epoch_float is fractional (epoch + iteration/iterations_per_epoch), so
+        # the LR rises smoothly within an epoch rather than in steps.
         return base_lr * (epoch_float + 1e-8) / max(warmup_epochs, 1e-8)
+    # After warmup, `progress` runs 0 -> 1 over the remaining epochs.
     progress = (epoch_float - warmup_epochs) / max(total_epochs - warmup_epochs, 1e-8)
     progress = min(max(progress, 0.0), 1.0)
+    # cos(pi*progress) goes 1 -> -1, so (1+cos)/2 goes 1 -> 0 and the LR decays
+    # from base_lr to min_lr. The decay is slow at first and slow again at the
+    # end, spending most of the run at a useful learning rate. Cutting the
+    # schedule short leaves the model at a high LR and costs about a point of
+    # top-1, which is why the epoch count and the schedule must match.
     return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
@@ -113,6 +127,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, args, sc
         optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
+            # bfloat16 autocast runs the convolutions in half precision while
+            # keeping the master weights in fp32. bf16 has the same exponent
+            # range as fp32, so unlike fp16 it cannot silently underflow and
+            # needs no gradient scaler. The backward pass stays outside the
+            # autocast block, which is the documented pattern.
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 logits = model(images)
                 loss = criterion(logits, targets)
@@ -138,6 +157,28 @@ def main() -> None:
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
+
+    # Never silently overwrite an existing checkpoint. Training writes
+    # best.pt whenever the current run beats its own best, which means a short
+    # run started for any reason (a smoke test, a changed hyper-parameter)
+    # replaces a fully trained model with a worse one and the original is gone.
+    # Existing checkpoints are moved aside with a timestamp instead.
+    # results/train_history.json is rewritten every epoch and is what the report
+    # figures are generated from, so a short run replaces the reported curves
+    # with partial ones exactly as it would replace the checkpoint. Both are
+    # moved aside together.
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    existing = [os.path.join(args.checkpoint_dir, f)
+                for f in os.listdir(args.checkpoint_dir) if f.endswith(".pt")]
+    history_path = os.path.join(args.results_dir, "train_history.json")
+    if os.path.exists(history_path):
+        existing.append(history_path)
+    if existing and not args.overwrite_checkpoints:
+        backup = os.path.join(args.checkpoint_dir, f"backup-{stamp}")
+        os.makedirs(backup, exist_ok=True)
+        for f in existing:
+            os.rename(f, os.path.join(backup, os.path.basename(f)))
+        print(f"moved {len(existing)} existing artefact(s) to {backup}\n")
 
     # ---------------------------------------------------------------- data
     data_cfg = DataConfig(root=args.data_root, batch_size=args.batch_size,
@@ -201,6 +242,9 @@ def main() -> None:
         if run is not None:
             run.log(record, step=epoch + 1)
 
+        # Track the best test accuracy rather than just the last epoch. With a
+        # cosine schedule the final epochs are usually the best, but not always,
+        # and the compression pipeline consumes this checkpoint.
         is_best = te["top1"] > best_top1
         if is_best:
             best_top1, best_epoch = te["top1"], epoch + 1
@@ -272,6 +316,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--device", default="cuda")
     p.add_argument("--checkpoint-dir", default="./checkpoints")
+    p.add_argument("--overwrite-checkpoints", action="store_true",
+                   help="allow replacing existing checkpoints instead of "
+                        "moving them aside")
     p.add_argument("--results-dir", default="./results")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", default="cs6886-a2-mobilenetv2")

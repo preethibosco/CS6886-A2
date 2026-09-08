@@ -41,11 +41,16 @@ def run_one(model, cfg: CompressionConfig, loaders, device, base_top1: float,
     t0 = time.time()
 
     if qat:
-        # Fine-tune first, then measure the size of the fine-tuned model. Doing
-        # it the other way round would report the size of a model that is not
-        # the one evaluated.
+        # Order matters. Fine-tuning changes the weights, and changed weights
+        # compress differently: training with the quantization grid in the loop
+        # concentrates weights onto fewer codes, which lowers the code entropy
+        # and makes the Huffman stage more effective. Measuring size before
+        # fine-tuning would describe a model nobody evaluates.
         tuned, hist = finetune(model, cfg, qcfg, train_loader, test_loader,
                                calib_loader, device)
+        # baseline_model=model, not `tuned`: the ratio must be quoted against
+        # the original fp32 network. `tuned` may already have BatchNorm folded
+        # away, and measuring against that understates the ratio.
         cmodel, res = compress(tuned, cfg, calib_loader, device, baseline_model=model)
     else:
         cmodel, res = compress(model, cfg, calib_loader, device)
@@ -99,6 +104,10 @@ def build_grid(args) -> List[CompressionConfig]:
         abits = tuple(int(b) for b in args.activation_bits.split(","))
         sparsities = tuple(float(s) for s in args.sparsities.split(","))
 
+    # itertools.product is the full cross product: 5 weight widths x 4
+    # activation widths x 3 sparsities = 60 configurations. A full grid rather
+    # than a random search, because the parallel-coordinates chart is only
+    # readable when every axis is evenly covered.
     return [
         CompressionConfig(weight_bits=w, activation_bits=a, sparsity=sp,
                           depthwise_bits=args.depthwise_bits, edge_bits=8, bn_bits=8,
@@ -179,6 +188,11 @@ def main() -> None:
                        "args": vars(args)}, f, indent=2)
 
     # Best configuration by accuracy at each compression level, for the report.
+    # A configuration is on the Pareto front when nothing else beats it on BOTH
+    # axes at once. Walking the list from the highest compression ratio
+    # downwards, a configuration joins the front only if it is more accurate
+    # than everything already there: anything already accepted has a higher
+    # ratio, so being less accurate than it means being worse on both counts.
     print("\nPareto front (no other configuration is both smaller and more accurate):")
     front = []
     for r in sorted(results, key=lambda r: -r["compression_ratio"]):

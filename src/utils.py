@@ -28,10 +28,14 @@ def seed_everything(seed: int = 42, deterministic: bool = False) -> None:
     the parent, but atomicAdd-based CUDA kernels remain nondeterministic unless
     `deterministic=True`. Documented here because Q5(b) asks for seed configuration.
     """
+    # Four separate generators have to be seeded; missing any one leaves a
+    # source of run-to-run variation. `random` drives some torchvision
+    # transforms, numpy drives others, torch drives weight initialisation and
+    # shuffling, and PYTHONHASHSEED fixes set/dict iteration order.
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)      # every visible GPU, not just cuda:0
     os.environ["PYTHONHASHSEED"] = str(seed)
 
     if deterministic:
@@ -69,6 +73,10 @@ class AverageMeter:
         self.count = 0
 
     def update(self, value: float, n: int = 1) -> None:
+        # Weighting by batch size n is what makes the epoch mean a true mean
+        # over samples. Averaging the per-batch means instead would over-weight
+        # the final short batch: with 50,000 images at batch size 128 the last
+        # batch holds 80 images but would count as much as a full one.
         self.sum += float(value) * n
         self.count += n
 

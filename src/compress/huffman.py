@@ -88,22 +88,39 @@ def _huffman_lengths(freqs: Dict[int, int]) -> Dict[int, int]:
     if len(freqs) == 1:
         return {next(iter(freqs)): 1}
 
+    # A min-heap ordered by frequency. Each entry is (frequency, tiebreak,
+    # symbols-underneath). The tiebreak counter keeps the ordering deterministic
+    # when two nodes have equal frequency, so the same input always produces the
+    # same code.
     counter = 0
     heap: List[Tuple[int, int, object]] = []
     for sym, f in sorted(freqs.items()):
         heapq.heappush(heap, (f, counter, [sym]))
         counter += 1
 
+    # We never build an explicit tree: only each symbol's depth is tracked,
+    # which is all a canonical code needs.
     depth: Dict[int, int] = {s: 0 for s in freqs}
     while len(heap) > 1:
+        # Merge the two RAREST nodes under a new parent. Taking the rarest first
+        # is what pushes rare symbols deep (long codes) and leaves frequent ones
+        # shallow (short codes).
         f1, _, syms1 = heapq.heappop(heap)
         f2, _, syms2 = heapq.heappop(heap)
         merged = syms1 + syms2
+        # Every symbol under this merge gained one ancestor, so its path from
+        # the root is now one bit longer.
         for s in merged:
-            depth[s] += 1                 # every symbol below the merge gets one more bit
+            depth[s] += 1
+        # The parent's frequency is the sum, and it competes for merging next.
         heapq.heappush(heap, (f1 + f2, counter, merged))
         counter += 1
 
+    # Worked example with frequencies {A:5, B:2, C:1}:
+    #   merge C(1)+B(2) -> depth[B]=depth[C]=1, new node with frequency 3
+    #   merge node(3)+A(5) -> depth[A]=1, depth[B]=depth[C]=2
+    #   lengths A=1, B=2, C=2. Total 5*1 + 2*2 + 1*2 = 11 bits, against
+    #   8 symbols * 2 bits = 16 for a fixed-width code.
     return depth
 
 
@@ -121,14 +138,25 @@ def _canonical_codes(lengths: Dict[int, int]) -> Dict[int, str]:
     codes: Dict[int, str] = {}
     code = 0
     prev_len = None
+    # Sort by (length, symbol): shortest codes first, ties broken by symbol id.
+    # The assignment then depends only on the lengths, so a decoder holding just
+    # the length table can rebuild every code.
     for sym in sorted(used, key=lambda s: (used[s], s)):
         L = used[sym]
         if prev_len is None:
             prev_len = L
         else:
+            # Next code = previous + 1, then shift left once per extra bit of
+            # length. The shift is what keeps the code prefix-free: moving to a
+            # longer length always lands past every shorter code already issued.
             code = (code + 1) << (L - prev_len)
             prev_len = L
-        codes[sym] = format(code, f"0{L}b")
+        codes[sym] = format(code, f"0{L}b")     # zero-padded to exactly L bits
+    # Worked example with lengths {A:1, B:2, C:2}:
+    #   A -> code 0            -> "0"
+    #   B -> (0+1)<<1 = 2      -> "10"
+    #   C -> 2+1     = 3       -> "11"
+    # "0" is not a prefix of "10" or "11", so the stream needs no separators.
     return codes
 
 
@@ -159,6 +187,11 @@ def decode(bitstring: str, code: HuffmanCode, num_symbols: int) -> List[int]:
     inverse = {c: s for s, c in code.codes.items()}
     out: List[int] = []
     buffer = ""
+    # Accumulate bits until the buffer matches a code, emit that symbol, reset.
+    # This works only because the code is prefix-free: no valid code starts
+    # another one, so the first match is never ambiguous and the decoder never
+    # backtracks. That is what lets variable-length codes be concatenated with
+    # nothing between them.
     for bit in bitstring:
         buffer += bit
         if buffer in inverse:
@@ -182,6 +215,14 @@ def entropy_bits(symbols: Sequence[int]) -> float:
     n = sum(counts.values())
     if n == 0:
         return 0.0
+    # H = -sum p*log2(p): the average bits per symbol the best possible
+    # symbol-wise code could reach.
+    #   uniform over 16 codes -> H = 4.00, so a 4-bit fixed code is already
+    #                            optimal and Huffman can win nothing
+    #   heavily peaked        -> H can drop below 1 bit, and Huffman takes most
+    #                            of that gap
+    # Reporting the achieved mean length against H shows how much of the
+    # available redundancy the coder actually captured.
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 

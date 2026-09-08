@@ -226,6 +226,9 @@ def finetune(model: nn.Module, cfg: CompressionConfig, qcfg: QATConfig,
 
         for it, (images, targets) in enumerate(train_loader):
             # cosine schedule over the fine-tuning horizon
+            # Cosine decay over the fine-tuning run, evaluated per iteration so
+            # the curve is smooth rather than stepped. cos goes from 1 to -1 as
+            # prog goes 0 to 1, so (1+cos)/2 goes 1 to 0 and the LR follows.
             prog = (epoch + it / iters) / max(qcfg.epochs, 1e-8)
             lr = qcfg.min_lr + 0.5 * (qcfg.lr - qcfg.min_lr) * (1 + math.cos(math.pi * prog))
             for g in optimizer.param_groups:
@@ -235,19 +238,37 @@ def finetune(model: nn.Module, cfg: CompressionConfig, qcfg: QATConfig,
             targets = targets.to(device, non_blocking=True)
 
             # --- STE: quantize -> forward/backward -> restore master -> step
+            # --- The straight-through estimator, four steps.
+            #
+            # 1. Swap every weight for its quantized value and keep the
+            #    full-precision original in `masters`.
             masters = _quantize_in_place(policy, masks, cfg, codebooks) \
                 if qcfg.quantize_weights else None
 
+            # 2. Run forward and backward on the QUANTIZED weights, so the loss
+            #    and the gradients describe the network that will actually be
+            #    deployed, not an fp32 one that never runs.
             optimizer.zero_grad(set_to_none=True)
             logits = work(images)
             loss = criterion(logits, targets)
             loss.backward()
 
+            # Clip before the step. At 3 bits the quantized forward pass and the
+            # full-precision master disagree enough to produce very large
+            # gradients, and one bad step is unrecoverable: a layer driven to
+            # huge values outputs garbage, its gradient goes to zero, and no
+            # later step can bring it back. See scripts/diagnose_qat_collapse.py.
             if qcfg.grad_clip and qcfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(work.parameters(), qcfg.grad_clip)
 
+            # 3. Put the full-precision weights back BEFORE stepping. The
+            #    optimiser then updates the master copy using gradients measured
+            #    at the quantized point. Without the master, any update smaller
+            #    than half a quantization step would round straight back to
+            #    where it started and training would stall immediately.
             if masters is not None:
                 _restore(policy, masters)
+            # 4. Step the master weights.
             optimizer.step()
 
             # Re-apply the mask: momentum and weight decay both move pruned
@@ -259,7 +280,12 @@ def finetune(model: nn.Module, cfg: CompressionConfig, qcfg: QATConfig,
             loss_meter.update(loss.item(), n)
             acc_meter.update((logits.argmax(1) == targets).float().mean().item() * 100, n)
 
-        # Evaluate in the deployed configuration: weights quantized, mask applied.
+        # Evaluate the model as it will actually be deployed: weights on the
+        # quantization grid, pruning mask applied. Evaluating the master weights
+        # instead would report an accuracy no shipped model ever achieves.
+        # Note that BatchNorm is NOT quantized here, only in the final
+        # compress() pass, which is why the last epoch's number can sit slightly
+        # above the reported one when bn_bits is low.
         masters = _quantize_in_place(policy, masks, cfg, codebooks) \
             if qcfg.quantize_weights else None
         te = evaluate(work, test_loader, device)

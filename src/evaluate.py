@@ -44,6 +44,12 @@ def evaluate(
     Returns:
         dict with keys 'top1', 'top5', 'loss' (top-1/top-5 as percentages).
     """
+    # Remember the mode so a model that was training goes back to training at
+    # the end. eval() does two things that matter here: it disables dropout, and
+    # it makes BatchNorm use its stored running statistics instead of the
+    # current batch's. Without eval(), a pass over the test set would keep
+    # updating those statistics, so the "before compression" model would no
+    # longer be the model that was compressed.
     was_training = model.training
     model.eval()
     model.to(device)
@@ -83,8 +89,15 @@ def topk_accuracy(logits: torch.Tensor, targets: torch.Tensor,
                   topk: Tuple[int, ...] = (1,)) -> Tuple[float, ...]:
     """Top-k accuracy as a percentage, for each k in `topk`."""
     maxk = max(topk)
+    # topk returns the maxk highest-scoring class indices per sample, sorted
+    # best first. logits (B, 10) -> pred (B, maxk).
     _, pred = logits.topk(maxk, dim=1, largest=True, sorted=True)   # (B, maxk)
+    # Broadcast the true label across the maxk guesses and compare, giving a
+    # boolean "was this guess right" matrix.
     correct = pred.eq(targets.view(-1, 1).expand_as(pred))          # (B, maxk)
+    # For top-k, the sample counts as correct if ANY of its first k guesses hit,
+    # hence .any(dim=1). Slicing [:, :k] reuses the same matrix for every k, so
+    # top-1 and top-5 cost one sort between them.
     return tuple(
         correct[:, :k].any(dim=1).float().sum().item() * 100.0 / targets.size(0)
         for k in topk

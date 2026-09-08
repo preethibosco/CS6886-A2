@@ -39,6 +39,12 @@ import torch.nn as nn
 @torch.no_grad()
 def fold_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
     """Return a new Conv2d with `bn` folded into it. Does not modify the inputs."""
+    # s is BatchNorm's per-channel multiplier once the statistics are frozen.
+    # gamma is the learned scale, running_var the tracked variance, eps a small
+    # constant that stops a near-zero-variance channel dividing by zero.
+    # One value per output channel, so folding it in rescales each filter
+    # independently. That is exactly why folding widens the spread of
+    # per-channel weight ranges and makes per-tensor quantization harder.
     s = bn.weight / torch.sqrt(bn.running_var + bn.eps)      # (C_out,)
 
     folded = nn.Conv2d(
@@ -46,8 +52,14 @@ def fold_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
         conv.padding, conv.dilation, conv.groups, bias=True,
         device=conv.weight.device, dtype=conv.weight.dtype,
     )
+    # reshape to (C_out, 1, 1, 1) so each output filter is multiplied by its own
+    # scale and broadcasting handles the other three axes.
     folded.weight.data = conv.weight.data * s.reshape(-1, 1, 1, 1)
+    # Our convs have bias=False, so prev_bias is zeros; the branch keeps the
+    # function correct for a conv that does carry one.
     prev_bias = conv.bias.data if conv.bias is not None else torch.zeros_like(bn.running_mean)
+    # b' = beta + s*(b - mu). With b = 0 this is beta - s*mu, the constant term
+    # left over once the mean subtraction is pushed into the convolution.
     folded.bias.data = bn.bias.data + s * (prev_bias - bn.running_mean)
     return folded
 
@@ -69,6 +81,10 @@ def fold_model(model: nn.Module) -> Tuple[nn.Module, int]:
     copy if the original is still needed.
     """
     folds = 0
+    # Only Sequential containers are scanned, because adjacency inside a
+    # Sequential is what guarantees the BatchNorm consumes that conv's output
+    # directly. Two modules being adjacent in named_modules() would prove
+    # nothing about how data flows between them.
     for module in model.modules():
         if not isinstance(module, nn.Sequential):
             continue
@@ -76,6 +92,10 @@ def fold_model(model: nn.Module) -> Tuple[nn.Module, int]:
             conv, bn = module[i], module[i + 1]
             if isinstance(conv, nn.Conv2d) and isinstance(bn, nn.BatchNorm2d):
                 module[i] = fold_conv_bn(conv, bn)
+                # Identity rather than deletion: removing the entry would shift
+                # every later index, breaking state-dict keys and the
+                # activation-quantizer hook sites. Identity costs nothing at
+                # run time and keeps ConvBNReLU matching isinstance checks.
                 module[i + 1] = nn.Identity()
                 folds += 1
     return model, folds

@@ -114,17 +114,29 @@ def kmeans_1d(values: torch.Tensor, num_bits: int, init: InitMethod = "linear",
     assign = torch.zeros_like(flat, dtype=torch.long)
     iterations = 0
     for iterations in range(1, max_iters + 1):
-        # 1. assignment step
+        # --- 1. assignment step: every weight takes its nearest centroid.
+        # unsqueeze turns (N,) and (k,) into (N,1) and (1,k); broadcasting then
+        # produces an (N, k) matrix of every weight-to-centroid distance. For
+        # the largest layer that is 307,200 x 16 = 4.9M entries, comfortable on
+        # a GPU, and it assigns the whole layer in one operation.
         dist = (flat.unsqueeze(1) - centroids.unsqueeze(0)).abs()   # (N, k)
-        assign = dist.argmin(dim=1)
+        assign = dist.argmin(dim=1)                                 # (N,) in [0, k)
 
-        # 2. update step: centroid = mean of its members
+        # --- 2. update step: each centroid moves to the mean of its members.
+        # index_add_ is a scatter-add: it walks `assign` and accumulates each
+        # weight into its cluster's slot, giving per-cluster sums and counts
+        # without a Python loop.
         new_centroids = centroids.clone()
         sums = torch.zeros_like(centroids).index_add_(0, assign, flat)
         counts = torch.zeros_like(centroids).index_add_(0, assign, torch.ones_like(flat))
+        # A cluster nobody chose would divide by zero, so it keeps its previous
+        # position. It stays in the codebook and may attract weights later,
+        # which keeps k fixed and leaves no holes in the code alphabet.
         nonempty = counts > 0
         new_centroids[nonempty] = sums[nonempty] / counts[nonempty]
 
+        # Stop once no centroid moves meaningfully. Lloyd's algorithm can only
+        # decrease the total squared error, so this loop always terminates.
         shift = (new_centroids - centroids).abs().max().item()
         centroids = new_centroids
         if shift < tol:
@@ -225,8 +237,13 @@ def update_centroids_from_gradients(weight: torch.Tensor, grad: torch.Tensor,
     Compression can reach 4 bits with negligible degradation where plain
     post-training clustering cannot.
     """
+    # Weights sharing a centroid must keep sharing it, so they cannot move
+    # independently. Their gradients are summed into one update for the shared
+    # value; index_add_ does the grouping by cluster index.
     grad_sums = torch.zeros_like(centroids)
     grad_sums.index_add_(0, indices[mask].flatten(), grad[mask].flatten().float())
+    # An ordinary SGD step, but on 2^b shared values instead of N weights. Which
+    # weight belongs to which cluster stays fixed; only the values move.
     return centroids - lr * grad_sums
 
 
@@ -310,8 +327,16 @@ def entropy_constrained_kmeans(values: torch.Tensor, num_bits: int, lam: float,
     iterations = 0
     for iterations in range(1, max_iters + 1):
         # --- assignment step, with the rate penalty folded in
+        # -log2(p) is the code length an entropy coder gives a symbol used a
+        # fraction p of the time: a cluster holding 50% of the weights costs
+        # 1 bit to name, one holding 1% costs about 6.6 bits.
         rate = -torch.log2(probs.clamp(min=floor))                    # (k,) bits
         dist = (flat.unsqueeze(1) - centroids.unsqueeze(0)) ** 2      # (N, k)
+        # Assign by distortion PLUS rate, not distortion alone. A popular
+        # cluster is cheap to name and attracts more weights; an unpopular one
+        # is expensive and empties out. That feedback pushes the code
+        # distribution away from uniform, which is exactly what plain k-means
+        # does not do, and why plain k-means works against the Huffman stage.
         assign = (dist + lam_eff * rate.unsqueeze(0)).argmin(dim=1)
 
         # --- update step: centroids to cluster means, probabilities to occupancy

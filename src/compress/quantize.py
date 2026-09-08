@@ -45,8 +45,13 @@ def quant_bounds(num_bits: int, scheme: QScheme) -> Tuple[int, int]:
     grid biases every layer slightly; the cost is one unused code out of 2^b.
     """
     if scheme == "symmetric":
+        # b=8 -> [-127, 127]  (not -128, see the docstring)
+        # b=4 -> [  -7,   7]
+        # b=2 -> [  -1,   1]   only three usable levels at 2 bits
         qmax = 2 ** (num_bits - 1) - 1
         return -qmax, qmax
+    # Asymmetric uses the whole unsigned range and lets zero_point carry the
+    # offset:  b=8 -> [0, 255],  b=4 -> [0, 15].
     return 0, 2 ** num_bits - 1
 
 
@@ -82,11 +87,17 @@ def compute_qparams(
     qmin, qmax = quant_bounds(num_bits, scheme)
 
     if granularity == "per_channel":
-        # Flatten every axis except the channel axis, so we can reduce over dim 1.
+        # Collapse everything except the channel axis so each row of `flat` is
+        # one output channel's weights, and one reduction gives one scale per
+        # channel. For a conv weight of shape (320, 960, 1, 1):
+        #     movedim -> (320, 960, 1, 1)   (channel_dim is already 0 here)
+        #     reshape -> (320, 960)         320 rows, one per output channel
         perm = x.movedim(channel_dim, 0)
         flat = perm.reshape(perm.shape[0], -1)
         reduce_dim = 1
     else:
+        # Per-tensor: one row containing every weight, so the reduction below
+        # produces a single scalar scale for the whole layer.
         flat = x.reshape(1, -1)
         reduce_dim = 1
 
@@ -95,8 +106,17 @@ def compute_qparams(
             absmax = torch.quantile(flat.abs().float(), percentile / 100.0, dim=reduce_dim)
         else:
             absmax = flat.abs().amax(dim=reduce_dim)
+        # The step size is the largest magnitude divided by the largest code.
+        # Worked example, b=4 (qmax=7) and max|w| = 0.35:
+        #     scale = 0.35/7 = 0.05, so codes -7..7 represent -0.35..0.35 in
+        #     steps of 0.05 and any weight below 0.025 rounds to code 0.
+        # This is why low-bit per-tensor quantization is itself a pruner: with
+        # 3 bits (qmax=3) the step is max|w|/3 and everything under max|w|/6
+        # becomes exactly zero.
         # A channel of all zeros would give scale 0 and produce NaNs; clamp it.
         scale = (absmax / qmax).clamp(min=1e-12)
+        # Symmetric means the grid is centred on zero, so no offset is needed
+        # and nothing has to be stored for it.
         zero_point = torch.zeros_like(scale)
     else:
         if percentile is not None:
@@ -110,7 +130,16 @@ def compute_qparams(
         # a large fraction of the values are exactly 0).
         lo = torch.minimum(lo, torch.zeros_like(lo))
         hi = torch.maximum(hi, torch.zeros_like(hi))
+        # Spread the 2^b codes evenly across the observed range.
+        # Worked example for a post-ReLU6 tensor at b=8, range [0, 6]:
+        #     scale      = (6 - 0) / 255      = 0.0235
+        #     zero_point = round(0 - 0/0.0235) = 0
+        # so code 0 means 0.0 and code 255 means 6.0. A symmetric quantizer on
+        # the same tensor would spend codes -127..0 on negative values that
+        # never occur, wasting half the range.
         scale = ((hi - lo) / (qmax - qmin)).clamp(min=1e-12)
+        # zero_point is the integer code that represents exactly 0.0. Storing it
+        # lets the grid be offset from zero while keeping real zeros exact.
         zero_point = torch.round(qmin - lo / scale).clamp(qmin, qmax)
 
     if granularity == "per_tensor":
@@ -120,8 +149,12 @@ def compute_qparams(
 
 def _broadcast_shape(x: torch.Tensor, param: torch.Tensor, channel_dim: int) -> torch.Tensor:
     """Reshape a per-channel (scale, zp) vector so it broadcasts against x."""
+    # A scalar (per-tensor) scale broadcasts against anything as-is.
     if param.ndim == 0:
         return param
+    # A per-channel scale is a 1-D vector of length C_out, but x is 4-D. Give it
+    # shape (C_out, 1, 1, 1) so PyTorch broadcasts one scale down each output
+    # channel: x/s then divides every weight by its own channel's step size.
     shape = [1] * x.ndim
     shape[channel_dim] = -1
     return param.reshape(shape)
@@ -167,7 +200,19 @@ class _RoundSTE(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (x,) = ctx.saved_tensors
+        # The true derivative of round() is 0 almost everywhere and undefined at
+        # the step boundaries, so an honest backward pass would return zeros and
+        # the network would never learn. The STE substitutes d(round(x))/dx = 1,
+        # i.e. it passes the incoming gradient straight through.
+        #
+        # The one place we do NOT pass it through is outside the clamp range. A
+        # weight that has been pushed past qmax is already saturated; letting
+        # gradient flow would keep pushing it further out with no effect on the
+        # output, and out there it would inflate max|w| and stretch the scale
+        # for every other weight in the tensor.
         mask = (x >= ctx.qmin) & (x <= ctx.qmax)
+        # Three return values because forward() took three arguments
+        # (x, qmin, qmax); the two integer bounds need no gradient.
         return grad_output * mask.to(grad_output.dtype), None, None
 
 
@@ -195,9 +240,16 @@ def fake_quantize(x: torch.Tensor, num_bits: int, scheme: QScheme = "symmetric",
     z = _broadcast_shape(x, zero_point, channel_dim)
 
     if differentiable:
+        # Training path: gradients flow through the STE above.
         q = _RoundSTE.apply(x / s + z, qmin, qmax)
     else:
+        # Evaluation path: plain rounding, no autograd machinery.
         q = torch.clamp(torch.round(x / s + z), qmin, qmax)
+    # Quantize then immediately dequantize. The value is now snapped to the
+    # integer grid but is still a float tensor, so ordinary conv kernels can run
+    # on it. The accuracy this produces is exactly what a real integer kernel
+    # would produce, which is why the whole pipeline can be evaluated without
+    # writing any integer kernels.
     return (q - z) * s
 
 
@@ -269,9 +321,16 @@ class ActivationQuantizer(nn.Module):
             batch_min, batch_max = x.detach().amin(), x.detach().amax()
 
         if torch.isinf(self.running_min):
+            # First batch: nothing to average against, so take it directly.
             self.running_min.fill_(batch_min.item())
             self.running_max.fill_(batch_max.item())
         else:
+            # Exponential moving average: new = (1-m)*old + m*batch.
+            # Averaging rather than taking a global max means one pathological
+            # batch cannot stretch the range for every later inference. The
+            # cost is that a genuinely rare large activation gets clipped, which
+            # is the right trade: clipping one outlier is cheaper than losing
+            # resolution on every ordinary value.
             m = self.cfg.ema_momentum
             self.running_min.mul_(1 - m).add_(m * batch_min)
             self.running_max.mul_(1 - m).add_(m * batch_max)
@@ -300,6 +359,10 @@ class ActivationQuantizer(nn.Module):
         self.calibrating = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Three states, in the order they occur during a run:
+        #   1. calibrating  - watch the data, pass it through untouched
+        #   2. neither      - a plain pass-through (before calibration starts)
+        #   3. enabled      - snap activations to the frozen grid
         if self.calibrating:
             self._observe(x)
             return x

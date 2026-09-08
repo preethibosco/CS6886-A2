@@ -148,11 +148,22 @@ def attach_activation_quantizers(model: nn.Module, cfg: CompressionConfig
     handles = []
     device = next(model.parameters()).device
 
+    # A PyTorch forward hook runs after a module produces its output, and if it
+    # RETURNS a value that value replaces the output. So the quantizer can be
+    # spliced into the network without editing a single line of the model
+    # definition. The closure captures `q` so each site keeps its own observed
+    # range; a shared hook would mix statistics from every layer together.
     def make_hook(q: ActivationQuantizer):
         def hook(module, inputs, output):
             return q(output)
         return hook
 
+    # Walking named_modules() reaches every submodule. Two types are hooked:
+    #   ConvBNReLU       output is post-ReLU6, so one-sided in [0, 6]
+    #   InvertedResidual output is post-residual-add, so signed
+    # Hooking the block rather than its projection conv avoids double counting:
+    # in a residual block the summed output is the tensor that gets written to
+    # memory, and the projection output is consumed immediately by the add.
     for name, module in model.named_modules():
         if isinstance(module, ConvBNReLU):
             scheme = "asymmetric"
@@ -181,15 +192,23 @@ def calibrate_activations(model: nn.Module, quantizers: Dict[str, ActivationQuan
     parameters and inflate the reported post-compression accuracy, so the
     calibration split comes from the training set (see data.py).
     """
+    # Phase 1: watch only. Every quantizer records the range of the tensors it
+    # sees and passes them through untouched, so the network still runs in fp32
+    # and the observed ranges are the true ones.
     for q in quantizers.values():
         q.calibrating, q.enabled = True, False
     model.eval().to(device)
 
+    # eval() matters here: it freezes the BatchNorm running statistics, so the
+    # activations observed are the ones inference will actually produce.
     for i, (images, _) in enumerate(calib_loader):
         if i >= max_batches:
             break
         model(images.to(device, non_blocking=True))
 
+    # Phase 2: turn the observed ranges into fixed (scale, zero_point) pairs and
+    # switch the quantizers on. From here the ranges never change again, which
+    # is what makes inference deterministic and the stored parameters finite.
     for q in quantizers.values():
         q.freeze()
         q.enabled = True
@@ -423,15 +442,27 @@ def compress_weights(model: nn.Module, cfg: CompressionConfig,
         is_edge = name in (first_name, last_name)
 
         # ---- layer policy: bit width and whether pruning applies
+        # The layer policy in one block. Ordering matters: the edge test comes
+        # first because the stem is also a non-depthwise conv and would
+        # otherwise fall through to the aggressive branch.
         if is_edge:
+            # Stem and classifier: 0.6% of parameters combined, sitting at the
+            # input and the output where error is not attenuated by any later
+            # layer. Kept at 8 bits, never pruned.
             bits = cfg.edge_bits
             kind = "stem" if name == first_name else "classifier"
             prunable = False
         elif is_depthwise:
+            # 2.9% of parameters, 9 weights per channel, no cross-channel
+            # mixing. Little redundancy to prune and no neighbour to absorb the
+            # error, so protecting them costs almost nothing in ratio.
             bits = cfg.depthwise_bits if cfg.depthwise_bits is not None else cfg.weight_bits
             kind = "depthwise"
             prunable = False
         else:
+            # Pointwise 1x1 convolutions: 95% of the model. Everything
+            # aggressive happens here, because nothing else is big enough to
+            # matter.
             bits = cfg.weight_bits
             kind = "pointwise"
             prunable = True

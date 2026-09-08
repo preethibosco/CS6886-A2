@@ -44,12 +44,22 @@ def magnitude_mask(weight: torch.Tensor, sparsity: float) -> torch.Tensor:
     if sparsity >= 1.0:
         return torch.zeros_like(weight, dtype=torch.bool)
 
+    # Magnitude pruning assumes |w| measures how much a weight matters. That is
+    # a heuristic, not a theorem, but it is what Deep Compression uses and it
+    # works well in practice: a weight near zero contributes near zero to every
+    # output it feeds.
     flat = weight.detach().abs().flatten()
+    # k = how many weights to remove. 80% of 307,200 -> remove 245,760.
     k = int(round(sparsity * flat.numel()))
     if k <= 0:
         return torch.ones_like(weight, dtype=torch.bool)
-    # kthvalue gives the k-th smallest; everything strictly greater is kept.
+    # kthvalue gives the k-th smallest magnitude. Using it rather than
+    # torch.quantile matters: quantile interpolates between neighbouring values
+    # and would return a threshold that is not any actual weight, so the
+    # achieved sparsity would drift slightly from the requested one.
     threshold = flat.kthvalue(k).values
+    # Strictly greater, so weights exactly at the threshold are also removed.
+    # Returns a bool tensor: True = keep, False = prune.
     return weight.detach().abs() > threshold
 
 
@@ -69,11 +79,18 @@ def global_masks(weights: Dict[str, torch.Tensor], sparsity: float) -> Dict[str,
     if sparsity <= 0.0:
         return {n: torch.ones_like(w, dtype=torch.bool) for n, w in weights.items()}
 
+    # Pool every prunable weight in the network into one flat tensor, then take
+    # a single threshold across all of them. A layer whose weights are large
+    # keeps almost all of them; a layer whose weights are small loses most.
+    # That is the point: the network decides, not the configuration.
     all_abs = torch.cat([w.detach().abs().flatten() for w in weights.values()])
     k = int(round(sparsity * all_abs.numel()))
     if k <= 0:
         return {n: torch.ones_like(w, dtype=torch.bool) for n, w in weights.items()}
     threshold = all_abs.kthvalue(k).values
+    # The same scalar threshold is applied to every layer, so achieved sparsity
+    # varies per layer. `Pruner.sparsity_report()` shows what each one ended up
+    # with, and `max_layer_sparsity` stops any of them being wiped out.
     return {n: (w.detach().abs() > threshold) for n, w in weights.items()}
 
 
@@ -157,6 +174,12 @@ class Pruner:
     @torch.no_grad()
     def apply(self) -> None:
         """Zero every pruned weight in place."""
+        # Multiplying by a 0/1 mask zeroes the pruned entries and leaves the
+        # rest untouched. This must run AFTER optimizer.step(), not instead of
+        # masking gradients: SGD with momentum keeps applying a velocity term
+        # to weights whose gradient is zero, and weight decay pulls every weight
+        # toward zero from wherever it is, so a pruned weight left alone will
+        # drift away from zero within a few steps and quietly un-prune itself.
         for name, module in self.prunable.items():
             if name in self.masks:
                 module.weight.mul_(self.masks[name].to(module.weight.dtype))
@@ -205,11 +228,16 @@ def encode_bitmap(codes: torch.Tensor, mask: torch.Tensor, value_bits: int) -> S
     bit for every weight whether or not it survives, so its overhead does not
     shrink as sparsity rises.
     """
-    n = mask.numel()
-    nnz = int(mask.sum().item())
+    n = mask.numel()                       # total weights in the tensor
+    nnz = int(mask.sum().item())           # number that survived pruning
+    # Boolean indexing keeps only the survivors, in flattened order. The decoder
+    # walks the bitmap and drops these values back into the True positions.
     values = codes.flatten()[mask.flatten()]
     return SparseEncoding(
         kind="bitmap",
+        # One presence bit for EVERY weight (n), plus b bits for each survivor.
+        # The n term does not shrink as sparsity rises, which is exactly why the
+        # relative-index encoding eventually overtakes this one.
         num_bits=n + nnz * value_bits,
         value_bits=nnz * value_bits,
         index_bits=n,
@@ -242,6 +270,22 @@ def encode_relative_index(codes: torch.Tensor, mask: torch.Tensor, value_bits: i
     flat_codes = codes.flatten()
     positions = torch.nonzero(flat_mask, as_tuple=False).flatten().tolist()
 
+    # Walk the survivors in order, storing the GAP to the previous one instead
+    # of its absolute index. Gaps are small, absolute indices are not: in a
+    # 307,200-weight tensor an index needs 19 bits, while a gap usually fits in
+    # 4 or 5.
+    #
+    # Worked example, index_bits=4 so max_delta=15, survivors at [2, 9, 40]:
+    #   pos=2   gap = 2-(-1) = 3    -> store delta 3
+    #   pos=9   gap = 9-2    = 7    -> store delta 7
+    #   pos=40  gap = 40-9   = 31   -> too big for 4 bits, so emit a filler
+    #                                  (delta 15, value 0), advance prev to 24,
+    #                                  then gap = 16, still too big, emit
+    #                                  another filler, prev = 39, gap = 1
+    #                               -> store delta 1
+    # Result: 5 entries for 3 real weights. Those 2 filler entries are pure
+    # overhead, and at high sparsity they can outnumber the real values, which
+    # is why the delta width is searched per layer rather than fixed at 4.
     deltas: List[int] = []
     values: List[float] = []
     prev = -1
@@ -250,6 +294,9 @@ def encode_relative_index(codes: torch.Tensor, mask: torch.Tensor, value_bits: i
         # Emit filler entries until the remaining gap fits in index_bits.
         while gap > max_delta:
             deltas.append(max_delta)
+            # A filler carries a zero weight, so its value symbol must be a code
+            # that decodes to exactly 0.0. That is why k-means reserves a
+            # codebook slot for zero whenever a mask is present.
             values.append(0.0)
             prev += max_delta
             gap = pos - prev
@@ -280,6 +327,10 @@ def decode_bitmap(enc: SparseEncoding) -> torch.Tensor:
 
 def decode_relative_index(enc: SparseEncoding) -> torch.Tensor:
     """Reconstruct the dense code tensor from a relative-index encoding."""
+    # Replay the walk: start before the tensor, add each delta to find the next
+    # position, and write the value there. Everything not written stays zero,
+    # which is correct for pruned positions. Filler entries write a 0.0 at a
+    # position that was going to be zero anyway, so they are harmless.
     out = torch.zeros(enc.payload["numel"])
     prev = -1
     for delta, value in zip(enc.payload["deltas"], enc.payload["values"]):
@@ -376,10 +427,23 @@ def relative_index_stats(mask: torch.Tensor, codes: torch.Tensor, index_bits: in
         return {"num_entries": 0, "num_fillers": 0, "nnz": 0,
                 "delta_counts": {}, "value_counts": {}}
 
+    # Vectorised version of the loop in `encode_relative_index`. Shifting the
+    # position vector by one gives every gap at once:
+    #     pos  = [ 2,  9, 40]
+    #     prev = [-1,  2,  9]      (-1 prepended, last element dropped)
+    #     gaps = [ 3,  7, 31]
     prev = torch.cat([torch.full((1,), -1, dtype=pos.dtype, device=pos.device), pos[:-1]])
     gaps = pos - prev
+    # Closed form for the loop's repeated subtraction. The loop subtracts
+    # max_delta until the gap fits, and the number of subtractions is
+    # (gap-1) // max_delta:
+    #     gap=15, md=15 -> 0 fillers   (already fits)
+    #     gap=16, md=15 -> 1 filler
+    #     gap=31, md=15 -> 2 fillers
+    # scripts/test_prune_encoding.py asserts this matches the loop exactly
+    # across 30 sparsity/width combinations.
     fillers = (gaps - 1) // max_delta
-    deltas = gaps - fillers * max_delta
+    deltas = gaps - fillers * max_delta          # each now in [1, max_delta]
     total_fillers = int(fillers.sum().item())
 
     delta_hist = torch.bincount(deltas, minlength=max_delta + 1)

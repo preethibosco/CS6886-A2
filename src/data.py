@@ -101,8 +101,13 @@ def build_loaders(cfg: DataConfig, download: bool = True):
     # Second view of the training data with no augmentation, for calibration.
     calib_source = CIFAR10(root=cfg.root, train=True, download=False, transform=eval_tf)
 
+    # A dedicated generator, seeded explicitly, so the calibration images are
+    # the same 1024 on every run regardless of what else consumed randomness
+    # first. Activation ranges depend on which images are seen, so an unseeded
+    # draw here would make the compression numbers wobble between runs.
     generator = torch.Generator().manual_seed(cfg.seed)
     calib_indices = torch.randperm(len(calib_source), generator=generator)[: cfg.calib_size]
+    # Subset wraps the dataset and remaps indices; it copies no image data.
     calib_set = Subset(calib_source, calib_indices.tolist())
 
     common = dict(num_workers=cfg.num_workers, pin_memory=True, persistent_workers=cfg.num_workers > 0)
